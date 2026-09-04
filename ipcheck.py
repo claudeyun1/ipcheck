@@ -548,7 +548,7 @@ DASHBOARD_TEMPLATE = """\
     <h1>📊 IP Access Dashboard</h1>
     <div class="right">
       <span id="refreshed"></span>
-      <button class="link" onclick="refreshAll()">🔄 새로고침</button>
+      <button class="link" id="refreshBtn">🔄 새로고침</button>
       <a href="/admin/logout">로그아웃</a>
     </div>
   </div>
@@ -568,13 +568,13 @@ DASHBOARD_TEMPLATE = """\
       값을 임의로 바꾸면 서명이 깨져 "위조 의심"으로 표시됩니다 (완전한 변조 차단은 아니며, 변조 시도를 탐지하는 방식입니다).</p>
     <div class="issue-row">
       <input id="newLabel" placeholder="라벨 (예: 고객사A, 2024-06 인쇄본)" maxlength="100">
-      <button class="btn btn-pri" id="issueBtn" onclick="issueVersion()">발급</button>
+      <button class="btn btn-pri" id="issueBtn">발급</button>
     </div>
     <div id="issueMsg" style="font-size:.83rem;margin:-.4rem 0 .8rem;display:none"></div>
     <div class="snippet-box" id="snippetBox">
       <div class="hint" style="margin-top:0">아래 스니펫을 해당 배포본 파일에 붙여넣으세요. ENDPOINT는 자동으로 이 서버 주소로 채워집니다.</div>
       <textarea id="snippetText" readonly></textarea>
-      <button class="btn btn-sec" onclick="copySnippet()">📋 복사</button>
+      <button class="btn btn-sec" id="copyBtn">📋 복사</button>
     </div>
     <table id="versions"><thead><tr><th>라벨</th><th>토큰</th><th>상태</th><th>히트</th><th>최근 접속</th><th>발급일</th><th></th></tr></thead><tbody></tbody></table>
   </div>
@@ -587,16 +587,16 @@ DASHBOARD_TEMPLATE = """\
   <div class="section">
     <h2>📋 최근 로그</h2>
     <div class="btn-row">
-      <button class="btn btn-pri" onclick="loadLogs(1)">첫 페이지</button>
-      <button class="btn btn-sec" id="prev" onclick="loadLogs(cur-1)">◀ 이전</button>
-      <button class="btn btn-sec" id="next" onclick="loadLogs(cur+1)">다음 ▶</button>
+      <button class="btn btn-pri" id="firstPageBtn">첫 페이지</button>
+      <button class="btn btn-sec" id="prev">◀ 이전</button>
+      <button class="btn btn-sec" id="next">다음 ▶</button>
       <span id="page-info" style="align-self:center;font-size:.85rem;color:#64748b;"></span>
       <a class="btn btn-sec" style="text-decoration:none;display:inline-block" id="exportBtn" href="#">⬇ CSV 내보내기</a>
     </div>
     <div class="filter">
       <input id="f-ip" placeholder="IP 필터" style="width:160px">
       <input id="f-id" placeholder="Track ID" style="width:220px">
-      <button class="btn btn-pri" onclick="loadLogs(1)">검색</button>
+      <button class="btn btn-pri" id="searchBtn">검색</button>
     </div>
     <table id="logs"><thead><tr><th>#</th><th>서버 IP</th><th>클라이언트 IP</th><th>배포본</th><th>UA</th><th>시간</th></tr></thead><tbody></tbody></table>
   </div>
@@ -667,7 +667,7 @@ DASHBOARD_TEMPLATE = """\
         <td>${x.hits}</td>
         <td>${x.last_seen ? fmt(x.last_seen) : "-"}</td>
         <td>${fmt(x.created_at)}</td>
-        <td>${x.revoked ? "" : `<button class="btn btn-sec" onclick="revokeVersion('${encodeURIComponent(x.token)}')">폐기</button>`}</td>
+        <td>${x.revoked ? "" : `<button class="btn btn-sec revoke-btn" data-token="${escapeHtml(x.token)}">폐기</button>`}</td>
       </tr>`).join("") : `<tr><td colspan="7" class="empty">발급된 배포본이 없습니다</td></tr>`;
     }
 
@@ -813,6 +813,31 @@ DASHBOARD_TEMPLATE = """\
 
     refreshAll();
     scheduleAutoRefresh();
+
+    // ── 이벤트 바인딩 (CSP: onclick 속성 대신 addEventListener 사용) ──────
+    document.getElementById("refreshBtn").addEventListener("click", refreshAll);
+    document.getElementById("issueBtn").addEventListener("click", issueVersion);
+    document.getElementById("copyBtn").addEventListener("click", copySnippet);
+    document.getElementById("firstPageBtn").addEventListener("click", function(){ loadLogs(1); });
+    document.getElementById("prev").addEventListener("click", function(){ loadLogs(cur - 1); });
+    document.getElementById("next").addEventListener("click", function(){ loadLogs(cur + 1); });
+    document.getElementById("searchBtn").addEventListener("click", function(){ loadLogs(1); });
+
+    // 검색 입력란에서 Enter 키로도 검색 가능하도록
+    ["f-ip", "f-id"].forEach(function(id) {
+      document.getElementById(id).addEventListener("keydown", function(e) {
+        if (e.key === "Enter") loadLogs(1);
+      });
+    });
+
+    // 폐기 버튼: 동적으로 생성되므로 versions 테이블에 이벤트 위임
+    document.getElementById("versions").addEventListener("click", function(e) {
+      var btn = e.target.closest(".revoke-btn");
+      if (!btn) return;
+      var token = btn.dataset.token;
+      if (!token) return;
+      revokeVersion(encodeURIComponent(token));
+    });
   </script>
 </body>
 </html>
