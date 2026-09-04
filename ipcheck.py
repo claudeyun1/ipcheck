@@ -67,6 +67,19 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
+# 1×1 투명 GIF (35 bytes) — JS 없이 이미지 로딩만으로 트래킹할 때 사용
+PIXEL_GIF = (
+    b"GIF89a\x01\x00\x01\x00"   # header, 1×1
+    b"\x80\x00\x00"              # GCT flag
+    b"\xff\xff\xff\x00\x00\x00"  # colors: white(transparent), black
+    b"\x21\xf9\x04\x01"         # Graphic Control Extension: transparent
+    b"\x00\x00\x00\x00"         # delay=0, transparent index=0, terminator
+    b"\x2c\x00\x00\x00\x00"     # Image Descriptor
+    b"\x01\x00\x01\x00\x00"     # 1×1, no local CT
+    b"\x02\x02\x4c\x01\x00"     # LZW data
+    b"\x3b"                      # GIF trailer
+)
+
 from flask import (
     Flask, Response, g, jsonify, redirect, render_template_string,
     request, session,
@@ -184,6 +197,7 @@ def _init_db():
             ip           TEXT    NOT NULL,
             client_ip    TEXT,
             ip_mismatch  INTEGER NOT NULL DEFAULT 0,
+            source       TEXT    NOT NULL DEFAULT 'js',
             track_id     TEXT,
             token        TEXT,
             verified     INTEGER NOT NULL DEFAULT 0,
@@ -198,6 +212,7 @@ def _init_db():
         ("verified",    "INTEGER NOT NULL DEFAULT 0"),
         ("client_ip",   "TEXT"),
         ("ip_mismatch", "INTEGER NOT NULL DEFAULT 0"),
+        ("source",      "TEXT NOT NULL DEFAULT 'js'"),
     ]:
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE access_log ADD COLUMN {col} {defn}")
@@ -448,6 +463,55 @@ def api_debug_headers():
     )
 
 
+@app.route("/pixel/<signed_id>")
+def tracking_pixel(signed_id):
+    """1×1 투명 GIF를 반환하면서 접근을 기록한다.
+    JS 없이 이미지 로딩만으로 트래킹 — Word/PDF/이메일 등에 사용.
+    캐시를 비활성화해 매 열람마다 새로 요청하도록 한다.
+    """
+    ip = _get_client_ip()
+    if _rate_limited(f"track:{ip}", limit=30, window=60):
+        # rate limit 시에도 이미지는 반환 (빈 바디 대신 픽셀 반환해야 깨진 이미지 방지)
+        resp = Response(PIXEL_GIF, mimetype="image/gif")
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
+
+    token, verified = _verify_signed_id(signed_id)
+    user_agent = request.headers.get("User-Agent", "")[:300]
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO access_log "
+        "(ip, client_ip, ip_mismatch, source, track_id, token, verified, user_agent, created_at) "
+        "VALUES (?, ?, 0, 'pixel', ?, ?, ?, ?, ?)",
+        (ip, ip, signed_id or None, token, 1 if verified else 0,
+         user_agent, datetime.now(timezone.utc).isoformat()),
+    )
+    db.commit()
+
+    resp = Response(PIXEL_GIF, mimetype="image/gif")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    # 이미지는 cross-origin 삽입이 기본 허용이지만, 명시적으로 CORS 허용
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+def _render_pixel_snippet(signed_id: str, label: str = "") -> str:
+    base = request.url_root.rstrip("/")
+    pixel_url = f"{base}/pixel/{signed_id}"
+    comment = f"<!-- pixel tracking: {label} -->" if label else "<!-- pixel tracking -->"
+    img_tag = (
+        f'<img src="{pixel_url}" '
+        'width="1" height="1" style="display:none;border:0;outline:0" '
+        'alt="" loading="eager" />'
+    )
+    return f"{comment}\n{img_tag}"
+
+
 @app.route("/track", methods=["POST", "OPTIONS"])
 def track():
     """접근 로깅 + 서버가 확인한 클라이언트 IP 반환.
@@ -476,8 +540,8 @@ def track():
     db = get_db()
     db.execute(
         "INSERT INTO access_log "
-        "(ip, client_ip, ip_mismatch, track_id, token, verified, user_agent, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(ip, client_ip, ip_mismatch, source, track_id, token, verified, user_agent, created_at) "
+        "VALUES (?, ?, ?, 'js', ?, ?, ?, ?, ?)",
         (ip, client_ip, ip_mismatch, raw_id or None, token,
          1 if verified else 0, user_agent, datetime.now(timezone.utc).isoformat()),
     )
@@ -579,6 +643,12 @@ DASHBOARD_TEMPLATE = """\
     .tag-revoked { background:#fee2e2; color:#991b1b; padding:1px 6px; border-radius:4px; font-size:.75rem; }
     .tag-ok { background:#dcfce7; color:#166534; padding:1px 6px; border-radius:4px; font-size:.75rem; }
     .hint { font-size:.78rem; color:#94a3b8; margin:-.5rem 0 1rem; }
+    .tabs { display:flex; gap:0; margin-bottom:.8rem; border-bottom:2px solid #e2e8f0; }
+    .tab { padding:.4rem .9rem; font-size:.85rem; cursor:pointer; border:none; background:none; color:#64748b; border-bottom:2px solid transparent; margin-bottom:-2px; }
+    .tab.active { color:#2563eb; border-bottom-color:#2563eb; font-weight:600; }
+    .tab-panel { display:none; } .tab-panel.active { display:block; }
+    .tag-js { background:#e0e7ff; color:#3730a3; padding:1px 5px; border-radius:3px; font-size:.72rem; }
+    .tag-pixel { background:#fef3c7; color:#92400e; padding:1px 5px; border-radius:3px; font-size:.72rem; }
   </style>
 </head>
 <body>
@@ -610,9 +680,20 @@ DASHBOARD_TEMPLATE = """\
     </div>
     <div id="issueMsg" style="font-size:.83rem;margin:-.4rem 0 .8rem;display:none"></div>
     <div class="snippet-box" id="snippetBox">
-      <div class="hint" style="margin-top:0">아래 스니펫을 해당 배포본 파일에 붙여넣으세요. ENDPOINT는 자동으로 이 서버 주소로 채워집니다.</div>
-      <textarea id="snippetText" readonly></textarea>
-      <button class="btn btn-sec" id="copyBtn">📋 복사</button>
+      <div class="tabs">
+        <button class="tab active" id="tabJs">JS 스니펫</button>
+        <button class="tab" id="tabPixel">이미지 픽셀</button>
+      </div>
+      <div class="tab-panel active" id="panelJs">
+        <div class="hint" style="margin-top:0">기존 fetchIp/getIp 코드 뒤에 붙여넣으세요. getIp()가 호출될 때 자동으로 추적합니다.</div>
+        <textarea id="snippetText" readonly></textarea>
+        <button class="btn btn-sec" id="copyBtn">📋 복사</button>
+      </div>
+      <div class="tab-panel" id="panelPixel">
+        <div class="hint" style="margin-top:0">JS 없이 이미지 로딩으로 추적합니다. Word·PDF·이메일·HTML 등 &lt;img&gt; 태그를 삽입할 수 있는 곳에 사용하세요.</div>
+        <textarea id="pixelText" readonly></textarea>
+        <button class="btn btn-sec" id="copyPixelBtn">📋 복사</button>
+      </div>
     </div>
     <table id="versions"><thead><tr><th>라벨</th><th>토큰</th><th>상태</th><th>히트</th><th>최근 접속</th><th>발급일</th><th></th></tr></thead><tbody></tbody></table>
   </div>
@@ -636,7 +717,7 @@ DASHBOARD_TEMPLATE = """\
       <input id="f-id" placeholder="Track ID" style="width:220px">
       <button class="btn btn-pri" id="searchBtn">검색</button>
     </div>
-    <table id="logs"><thead><tr><th>#</th><th>IP</th><th>배포본</th><th>UA</th><th>시간</th></tr></thead><tbody></tbody></table>
+    <table id="logs"><thead><tr><th>#</th><th>IP</th><th>구분</th><th>배포본</th><th>UA</th><th>시간</th></tr></thead><tbody></tbody></table>
   </div>
 
   <script nonce="{{ nonce }}">
@@ -745,6 +826,7 @@ DASHBOARD_TEMPLATE = """\
 
         // 스니펫 표시 및 해당 위치로 스크롤
         document.getElementById("snippetText").value = d.snippet;
+        document.getElementById("pixelText").value = d.pixel_snippet;
         const box = document.getElementById("snippetBox");
         box.style.display = "block";
         box.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -805,14 +887,19 @@ DASHBOARD_TEMPLATE = """\
 
         const displayIp = r.client_ip || r.ip || "-";
 
+        const srcBadge = r.source === 'pixel'
+          ? '<span class="tag-pixel">🖼 이미지</span>'
+          : '<span class="tag-js">JS</span>';
+
         return `<tr>
         <td>${r.id}</td>
         <td>${escapeHtml(displayIp)}</td>
+        <td>${srcBadge}</td>
         <td>${idCell}</td>
         <td title="${escapeHtml(r.user_agent || '')}">${escapeHtml((r.user_agent || "").slice(0,40))}</td>
         <td>${fmt(r.created_at)}</td>
       </tr>`;
-      }).join("") : `<tr><td colspan="5" class="empty">로그가 없습니다</td></tr>`;
+      }).join("") : `<tr><td colspan="6" class="empty">로그가 없습니다</td></tr>`;
       document.getElementById("page-info").textContent = `페이지 ${d.page}/${d.pages} (총 ${d.total}건)`;
       document.getElementById("prev").disabled = d.page <= 1;
       document.getElementById("next").disabled = d.page >= d.pages;
@@ -846,6 +933,25 @@ DASHBOARD_TEMPLATE = """\
     document.getElementById("refreshBtn").addEventListener("click", refreshAll);
     document.getElementById("issueBtn").addEventListener("click", issueVersion);
     document.getElementById("copyBtn").addEventListener("click", copySnippet);
+    document.getElementById("copyPixelBtn").addEventListener("click", function() {
+      var el = document.getElementById("pixelText");
+      el.select();
+      navigator.clipboard && navigator.clipboard.writeText(el.value);
+    });
+
+    // JS/픽셀 탭 전환
+    document.getElementById("tabJs").addEventListener("click", function() {
+      document.getElementById("tabJs").classList.add("active");
+      document.getElementById("tabPixel").classList.remove("active");
+      document.getElementById("panelJs").classList.add("active");
+      document.getElementById("panelPixel").classList.remove("active");
+    });
+    document.getElementById("tabPixel").addEventListener("click", function() {
+      document.getElementById("tabPixel").classList.add("active");
+      document.getElementById("tabJs").classList.remove("active");
+      document.getElementById("panelPixel").classList.add("active");
+      document.getElementById("panelJs").classList.remove("active");
+    });
     document.getElementById("firstPageBtn").addEventListener("click", function(){ loadLogs(1); });
     document.getElementById("prev").addEventListener("click", function(){ loadLogs(cur - 1); });
     document.getElementById("next").addEventListener("click", function(){ loadLogs(cur + 1); });
@@ -1000,7 +1106,7 @@ def api_logs():
     pages = max(1, (total + size - 1) // size)
     page = min(page, pages)
     rows = db.execute(
-        f"SELECT a.id, a.client_ip, a.ip, a.track_id, a.token, "
+        f"SELECT a.id, a.client_ip, a.ip, a.source, a.track_id, a.token, "
         f"a.verified, a.user_agent, a.created_at, v.label, v.revoked "
         f"FROM access_log a LEFT JOIN track_versions v ON v.token = a.token "
         f"{where_sql} "
@@ -1011,10 +1117,11 @@ def api_logs():
     return jsonify(
         page=page, pages=pages, total=total,
         rows=[
-            {"id": r[0], "ip": r[1] or r[2],   # client_ip 우선, 없으면 server ip
-             "client_ip": r[1], "track_id": r[3], "token": r[4], "verified": bool(r[5]),
-             "user_agent": r[6], "created_at": r[7],
-             "label": r[8], "revoked": bool(r[9]) if r[9] is not None else False}
+            {"id": r[0], "ip": r[1] or r[2],
+             "client_ip": r[1], "source": r[3] or "js",
+             "track_id": r[4], "token": r[5], "verified": bool(r[6]),
+             "user_agent": r[7], "created_at": r[8],
+             "label": r[9], "revoked": bool(r[10]) if r[10] is not None else False}
             for r in rows
         ],
     )
@@ -1145,7 +1252,9 @@ def api_versions_create():
     )
     db.commit()
 
-    return jsonify(token=token, signed_id=signed_id, label=label, snippet=_render_snippet(signed_id, label))
+    return jsonify(token=token, signed_id=signed_id, label=label,
+                   snippet=_render_snippet(signed_id, label),
+                   pixel_snippet=_render_pixel_snippet(signed_id, label))
 
 
 @app.route("/admin/api/versions/<token>/revoke", methods=["POST"])
