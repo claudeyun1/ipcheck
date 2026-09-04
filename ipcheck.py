@@ -49,7 +49,7 @@ Render(무료 플랜) 배포 시 참고:
     - 무료 플랜은 파일시스템이 휘발성이라 재배포/스핀다운(15분 무활동) 시마다
       SQLite 파일(access_log.db)이 초기화된다. 데이터 영속이 필요하면 Render
       Postgres 등 관리형 DB로 옮겨야 한다 (이 스크립트는 SQLite 전용).
-    - Start Command 예: gunicorn -w 1 --threads 4 -b 0.0.0.0:$PORT ipcheck:app
+    - Start Command 예: gunicorn -w 1 --threads 4 -b 0.0.0.0:$PORT ip_logger:app
       (내장 개발 서버(app.run)는 운영 배포에 쓰지 말 것)
 """
 
@@ -568,8 +568,9 @@ DASHBOARD_TEMPLATE = """\
       값을 임의로 바꾸면 서명이 깨져 "위조 의심"으로 표시됩니다 (완전한 변조 차단은 아니며, 변조 시도를 탐지하는 방식입니다).</p>
     <div class="issue-row">
       <input id="newLabel" placeholder="라벨 (예: 고객사A, 2024-06 인쇄본)" maxlength="100">
-      <button class="btn btn-pri" onclick="issueVersion()">발급</button>
+      <button class="btn btn-pri" id="issueBtn" onclick="issueVersion()">발급</button>
     </div>
+    <div id="issueMsg" style="font-size:.83rem;margin:-.4rem 0 .8rem;display:none"></div>
     <div class="snippet-box" id="snippetBox">
       <div class="hint" style="margin-top:0">아래 스니펫을 해당 배포본 파일에 붙여넣으세요. ENDPOINT는 자동으로 이 서버 주소로 채워집니다.</div>
       <textarea id="snippetText" readonly></textarea>
@@ -671,22 +672,60 @@ DASHBOARD_TEMPLATE = """\
     }
 
     async function issueVersion() {
-      const label = document.getElementById("newLabel").value.trim();
-      if (!label) return;
+      const labelEl = document.getElementById("newLabel");
+      const btn     = document.getElementById("issueBtn");
+      const msgEl   = document.getElementById("issueMsg");
+
+      const label = labelEl.value.trim();
+
+      // 라벨 미입력 시 인라인 메시지 표시 (조용히 종료하지 않음)
+      if (!label) {
+        msgEl.style.display = "block";
+        msgEl.style.color   = "#b45309";
+        msgEl.textContent   = "⚠ 라벨을 입력하세요.";
+        labelEl.focus();
+        return;
+      }
+
+      // 버튼 로딩 상태
+      btn.disabled    = true;
+      btn.textContent = "발급 중…";
+      msgEl.style.display = "none";
+
       try {
         const r = await fetch("/admin/api/versions", {
-          method: "POST", credentials: "same-origin",
+          method: "POST",
+          credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ label }),
         });
-        if (!r.ok) throw new Error("발급 실패");
+
+        if (r.status === 401) { location = "/admin"; return; }
+        if (!r.ok) throw new Error("HTTP " + r.status);
+
         const d = await r.json();
-        document.getElementById("snippetBox").style.display = "block";
+
+        // 스니펫 표시 및 해당 위치로 스크롤
         document.getElementById("snippetText").value = d.snippet;
-        document.getElementById("newLabel").value = "";
+        const box = document.getElementById("snippetBox");
+        box.style.display = "block";
+        box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+
+        // 성공 메시지
+        msgEl.style.display = "block";
+        msgEl.style.color   = "#166534";
+        msgEl.textContent   = `✅ "${d.label}" 발급 완료. 아래 스니펫을 복사해 배포 파일에 붙여넣으세요.`;
+
+        labelEl.value = "";
         loadVersions();
       } catch (e) {
-        showError(true);
+        console.error("issueVersion error:", e);
+        msgEl.style.display = "block";
+        msgEl.style.color   = "#b91c1c";
+        msgEl.textContent   = "❌ 발급 실패: " + e.message + " (로그인이 만료됐다면 페이지를 새로고침하세요)";
+      } finally {
+        btn.disabled    = false;
+        btn.textContent = "발급";
       }
     }
 
