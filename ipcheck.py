@@ -54,6 +54,7 @@ Render(무료 플랜) 배포 시 참고:
 """
 
 import csv
+import hashlib
 import hmac
 import io
 import os
@@ -98,6 +99,15 @@ if not _admin_pass_hash:
 TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "0"))
 HTTPS_ONLY = os.environ.get("HTTPS_ONLY", "0") == "1"
 SESSION_MINUTES = int(os.environ.get("SESSION_MINUTES", "30"))
+
+_track_signing_key = os.environ.get("TRACK_SIGNING_KEY")
+if not _track_signing_key:
+    _track_signing_key = _secret
+    print("⚠  TRACK_SIGNING_KEY 미설정: SECRET_KEY를 대신 사용합니다. "
+          "배포본에 심어둔 서명된 track_id는 이 키가 바뀌면 전부 위조 판정을 받게 됩니다. "
+          "이미 배포한 파일이 있다면 TRACK_SIGNING_KEY를 반드시 고정값으로 별도 지정하고, "
+          "재배포/재시작 후에도 절대 바꾸지 마세요.")
+TRACK_SIGNING_KEY = _track_signing_key.encode()
 
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -163,16 +173,41 @@ def _init_db():
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS access_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            ip          TEXT    NOT NULL,
-            track_id    TEXT,
-            user_agent  TEXT,
-            created_at  TEXT    NOT NULL
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip           TEXT    NOT NULL,
+            client_ip    TEXT,
+            ip_mismatch  INTEGER NOT NULL DEFAULT 0,
+            track_id     TEXT,
+            token        TEXT,
+            verified     INTEGER NOT NULL DEFAULT 0,
+            user_agent   TEXT,
+            created_at   TEXT    NOT NULL
         )
     """)
+    # 기존 DB(구버전 스키마)를 쓰던 경우를 위한 마이그레이션 — 이미 있으면 조용히 건너뜀
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(access_log)").fetchall()}
+    for col, defn in [
+        ("token",       "TEXT"),
+        ("verified",    "INTEGER NOT NULL DEFAULT 0"),
+        ("client_ip",   "TEXT"),
+        ("ip_mismatch", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE access_log ADD COLUMN {col} {defn}")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS track_versions (
+            token       TEXT PRIMARY KEY,
+            label       TEXT NOT NULL,
+            revoked     INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT NOT NULL
+        )
+    """)
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_track_id ON access_log(track_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_created  ON access_log(created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ip_created ON access_log(ip, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_token ON access_log(token)")
     conn.commit()
     conn.close()
 
@@ -185,11 +220,44 @@ def _get_client_ip() -> str:
 
 
 def _is_valid_uuid(value) -> bool:
+    # (더 이상 track_id 검증에는 쓰지 않지만, 다른 용도로 UUID 형식 확인이
+    # 필요할 때를 위해 유틸리티로 남겨둔다.)
     try:
         uuid.UUID(str(value))
         return True
     except (ValueError, AttributeError, TypeError):
         return False
+
+
+# ─── 배포본(버전) 서명 토큰 ──────────────────────────────────────
+# 배포된 파일마다 고정된 식별자를 심되, 받는 사람이 값을 마음대로 다른
+# 유효해 보이는 값으로 바꿔치기하지 못하도록 서버만 아는 키(TRACK_SIGNING_KEY)로
+# HMAC 서명한다. 형식: "<token>.<signature>"
+# 주의: 이건 "수정 자체를 원천 차단"하는 게 아니라 "수정하면 서명이 깨져서
+# 서버가 위조를 탐지"하는 방식이다. 정적 HTML/JS는 원리상 최종 사용자가
+# 텍스트 편집기로 열어볼 수 있는 형태라 완벽한 변조 방지는 불가능하며,
+# 이것이 실질적으로 도달 가능한 최선의 방어선이다 (경량 난독화는 보조 수단일 뿐).
+def _sign_token(token: str) -> str:
+    sig = hmac.new(TRACK_SIGNING_KEY, token.encode(), hashlib.sha256).hexdigest()[:24]
+    return f"{token}.{sig}"
+
+
+def _verify_signed_id(signed_id: str):
+    """반환: (token 또는 None, verified: bool)"""
+    if not signed_id or "." not in signed_id:
+        return None, False
+    token, _, sig = signed_id.rpartition(".")
+    if not token or not sig:
+        return None, False
+    expected = hmac.new(TRACK_SIGNING_KEY, token.encode(), hashlib.sha256).hexdigest()[:24]
+    if hmac.compare_digest(sig, expected):
+        return token, True
+    return token, False  # 서명 불일치 → token은 참고용으로만 반환(위조 의심 표시용)
+
+
+def _new_version_token() -> str:
+    # URL-safe, 대소문자 구분되는 짧은 랜덤 토큰 (버전 식별용)
+    return secrets.token_urlsafe(9)
 
 
 def _check_auth(user: str, pw: str) -> bool:
@@ -239,6 +307,15 @@ def _security_headers(resp):
     )
     if HTTPS_ONLY:
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+
+    # /track, /ip 는 인증 없는 공개 엔드포인트라, 다른 도메인(정적 페이지)에
+    # 심어둔 tracking snippet에서도 호출할 수 있도록 CORS를 허용한다.
+    # (응답에 쿠키/세션 정보가 없으므로 '*' 허용이 안전함)
+    if request.path in ("/track", "/ip"):
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Max-Age"] = "3600"
     return resp
 
 
@@ -267,20 +344,28 @@ PAGE_TEMPLATE = """\
   <script nonce="{{ nonce }}">
   (function () {
     var TRACK_ID = "{{ track_id }}";          // 서버가 삽입한 내부 ID
+    // "/track"은 상대 경로라서 "이 스크립트가 실행되는 페이지의 도메인" 기준으로
+    // 요청이 나간다. 이 /page 라우트를 그대로 방문할 때만 유효하며(같은 origin),
+    // 이 스니펫을 다른 도메인의 정적 페이지에 복사해 붙여넣을 경우에는
+    // 반드시 절대 URL(예: "https://내앱.onrender.com/track")로 바꿔야 한다.
     var ENDPOINT = "/track";                  // 추적 API
 
     function send() {
-      var payload = { id: TRACK_ID };
-      // navigator.sendBeacon: 페이지 unload 시에도 전송 보장
+      var payload = JSON.stringify({ id: TRACK_ID });
+      // Content-Type을 text/plain으로 보내면 브라우저가 "단순 요청"으로 취급해
+      // 교차 출처(cross-origin)로 호출해도 CORS preflight 없이 바로 전송된다.
+      // 서버는 Content-Type과 무관하게 바디를 JSON으로 파싱하므로 동작엔 문제없음.
       if (navigator.sendBeacon) {
-        var blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
+        // navigator.sendBeacon: 페이지 unload 시에도 전송 보장
+        var blob = new Blob([payload], { type: "text/plain" });
         navigator.sendBeacon(ENDPOINT, blob);
       } else {
         fetch(ENDPOINT, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
+          headers: { "Content-Type": "text/plain" },
+          body: payload,
           keepalive: true,
+          mode: "cors",
         }).catch(function(){});
       }
     }
@@ -308,28 +393,60 @@ def healthz():
 
 @app.route("/page")
 def serve_page():
-    track_id = str(uuid.uuid4())
+    # 데모용 페이지: 방문마다 임시 서명 토큰을 발급 (버전 관리 목록에는 등록되지 않음).
+    # 실제 "배포본별 고정 track_id" 운영은 /admin 대시보드의 "배포본 발급" 기능으로
+    # 만든 서명된 ID를 tracking_snippet_standalone.html에 박아 넣어 배포하는 방식을 쓴다.
+    track_id = _sign_token(str(uuid.uuid4()))
     return render_template_string(PAGE_TEMPLATE, track_id=track_id, nonce=g.csp_nonce)
 
 
-@app.route("/track", methods=["POST"])
+@app.route("/ip", methods=["GET", "OPTIONS"])
+def ip_lookup():
+    """로깅 없이 클라이언트 IP만 반환. getIp() 폴백 체인의 끝단으로 사용.
+    응답 형식: {"ip": "x.x.x.x"}  ← ipify(api4.ipify.org) 와 동일한 포맷.
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+    return jsonify(ip=_get_client_ip())
+
+
+@app.route("/track", methods=["POST", "OPTIONS"])
 def track():
+    """접근 로깅 + 서버가 확인한 클라이언트 IP 반환.
+    응답 형식: {"ip": "x.x.x.x"}  ← ipify 와 동일한 포맷.
+    클라이언트는 이 값을 getIp() 폴백 결과로 사용할 수 있다.
+    """
+    if request.method == "OPTIONS":
+        # non-simple 헤더(Content-Type: application/json 등) 사용 시 브라우저가
+        # 먼저 preflight를 보냄. text/plain 스니펫은 preflight가 발생하지 않는다.
+        return "", 204
+
     ip = _get_client_ip()
     if _rate_limited(f"track:{ip}", limit=30, window=60):
         return jsonify(error="rate_limited"), 429
 
     data = request.get_json(silent=True, force=True) or {}
-    raw_id = data.get("id", "")
-    track_id = raw_id if _is_valid_uuid(raw_id) else None
+    raw_id    = str(data.get("id", ""))[:120]
+    token, verified = _verify_signed_id(raw_id)
     user_agent = request.headers.get("User-Agent", "")[:300]
+
+    # 클라이언트가 외부 서비스(ipify 등)로 직접 조회해 보낸 IP.
+    # 서버가 소켓에서 확인한 ip와 다르면 프록시/VPN 사용 가능성을 표시한다.
+    client_ip  = str(data.get("client_ip", "") or "")[:64].strip() or None
+    ip_mismatch = int(bool(client_ip and client_ip != ip))
 
     db = get_db()
     db.execute(
-        "INSERT INTO access_log (ip, track_id, user_agent, created_at) VALUES (?, ?, ?, ?)",
-        (ip, track_id, user_agent, datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO access_log "
+        "(ip, client_ip, ip_mismatch, track_id, token, verified, user_agent, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (ip, client_ip, ip_mismatch, raw_id or None, token,
+         1 if verified else 0, user_agent, datetime.now(timezone.utc).isoformat()),
     )
     db.commit()
-    return "", 204  # 204는 바디가 없어야 하므로 빈 문자열 반환 (원본은 JSON 바디를 포함한 버그)
+    # ipify 호환 형식으로 서버가 확인한 IP 반환.
+    # 클라이언트(getIp 폴백 체인)가 이 값을 라이선스 검증에 활용할 수 있다.
+    return jsonify(ip=ip)
 
 
 # ─── 관리자 ─────────────────────────────────────────────────
@@ -416,6 +533,14 @@ DASHBOARD_TEMPLATE = """\
     .trend .bar-label { font-size:.7rem; color:#94a3b8; }
     .empty { text-align:center; color:#94a3b8; padding:1.5rem; font-size:.85rem; }
     .err-banner { background:#fef2f2; color:#b91c1c; padding:.6rem 1rem; border-radius:6px; font-size:.85rem; margin-bottom:1rem; display:none; }
+    .issue-row { display:flex; gap:.5rem; margin-bottom:1rem; flex-wrap:wrap; }
+    .issue-row input { flex:1; min-width:180px; padding:.5rem .7rem; border:1px solid #ddd; border-radius:6px; font-size:.85rem; }
+    .snippet-box { display:none; margin-top:1rem; }
+    .snippet-box textarea { width:100%; height:110px; font-family:ui-monospace,monospace; font-size:.78rem; padding:.7rem; border:1px solid #ddd; border-radius:6px; resize:vertical; }
+    .tag-warn { background:#fef3c7; color:#92400e; padding:1px 6px; border-radius:4px; font-size:.75rem; }
+    .tag-revoked { background:#fee2e2; color:#991b1b; padding:1px 6px; border-radius:4px; font-size:.75rem; }
+    .tag-ok { background:#dcfce7; color:#166534; padding:1px 6px; border-radius:4px; font-size:.75rem; }
+    .hint { font-size:.78rem; color:#94a3b8; margin:-.5rem 0 1rem; }
   </style>
 </head>
 <body>
@@ -438,6 +563,22 @@ DASHBOARD_TEMPLATE = """\
   </div>
 
   <div class="section">
+    <h2>🏷️ 배포본(버전) 관리</h2>
+    <p class="hint">라벨을 지정해 배포본별 고정 track_id를 발급합니다. 발급된 ID는 서버 서명이 포함되어 있어
+      값을 임의로 바꾸면 서명이 깨져 "위조 의심"으로 표시됩니다 (완전한 변조 차단은 아니며, 변조 시도를 탐지하는 방식입니다).</p>
+    <div class="issue-row">
+      <input id="newLabel" placeholder="라벨 (예: 고객사A, 2024-06 인쇄본)" maxlength="100">
+      <button class="btn btn-pri" onclick="issueVersion()">발급</button>
+    </div>
+    <div class="snippet-box" id="snippetBox">
+      <div class="hint" style="margin-top:0">아래 스니펫을 해당 배포본 파일에 붙여넣으세요. ENDPOINT는 자동으로 이 서버 주소로 채워집니다.</div>
+      <textarea id="snippetText" readonly></textarea>
+      <button class="btn btn-sec" onclick="copySnippet()">📋 복사</button>
+    </div>
+    <table id="versions"><thead><tr><th>라벨</th><th>토큰</th><th>상태</th><th>히트</th><th>최근 접속</th><th>발급일</th><th></th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="section">
     <h2>🏆 Top 10 IP</h2>
     <table id="top-ips"><thead><tr><th>IP</th><th>접속 횟수</th></tr></thead><tbody></tbody></table>
   </div>
@@ -456,7 +597,7 @@ DASHBOARD_TEMPLATE = """\
       <input id="f-id" placeholder="Track ID" style="width:220px">
       <button class="btn btn-pri" onclick="loadLogs(1)">검색</button>
     </div>
-    <table id="logs"><thead><tr><th>#</th><th>IP</th><th>Track ID</th><th>UA</th><th>시간</th></tr></thead><tbody></tbody></table>
+    <table id="logs"><thead><tr><th>#</th><th>서버 IP</th><th>클라이언트 IP</th><th>배포본</th><th>UA</th><th>시간</th></tr></thead><tbody></tbody></table>
   </div>
 
   <script nonce="{{ nonce }}">
@@ -494,7 +635,8 @@ DASHBOARD_TEMPLATE = """\
       document.getElementById("stats").innerHTML = `
         <div class="card"><div class="num">${s.total}</div><div class="label">총 접속</div></div>
         <div class="card"><div class="num">${s.unique_ips}</div><div class="label">고유 IP</div></div>
-        <div class="card"><div class="num">${s.unique_ids}</div><div class="label">고유 Track ID</div></div>
+        <div class="card"><div class="num">${s.unique_ids}</div><div class="label">고유 배포본(검증됨)</div></div>
+        <div class="card"><div class="num">${s.tamper_count}</div><div class="label">서명 불일치(위조 의심)</div></div>
         <div class="card"><div class="num">${s.today}</div><div class="label">오늘 접속</div></div>
       `;
       const tb = document.querySelector("#top-ips tbody");
@@ -513,6 +655,53 @@ DASHBOARD_TEMPLATE = """\
       `).join("");
     }
 
+    async function loadVersions() {
+      const v = await api("/admin/api/versions");
+      if (!v) return;
+      const tb = document.querySelector("#versions tbody");
+      tb.innerHTML = v.versions.length ? v.versions.map(x => `<tr>
+        <td>${escapeHtml(x.label)}</td>
+        <td><span class="badge" title="${escapeHtml(x.token)}">${escapeHtml(x.token.slice(0,10))}…</span></td>
+        <td>${x.revoked ? '<span class="tag-revoked">폐기됨</span>' : '<span class="tag-ok">활성</span>'}</td>
+        <td>${x.hits}</td>
+        <td>${x.last_seen ? fmt(x.last_seen) : "-"}</td>
+        <td>${fmt(x.created_at)}</td>
+        <td>${x.revoked ? "" : `<button class="btn btn-sec" onclick="revokeVersion('${encodeURIComponent(x.token)}')">폐기</button>`}</td>
+      </tr>`).join("") : `<tr><td colspan="7" class="empty">발급된 배포본이 없습니다</td></tr>`;
+    }
+
+    async function issueVersion() {
+      const label = document.getElementById("newLabel").value.trim();
+      if (!label) return;
+      try {
+        const r = await fetch("/admin/api/versions", {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ label }),
+        });
+        if (!r.ok) throw new Error("발급 실패");
+        const d = await r.json();
+        document.getElementById("snippetBox").style.display = "block";
+        document.getElementById("snippetText").value = d.snippet;
+        document.getElementById("newLabel").value = "";
+        loadVersions();
+      } catch (e) {
+        showError(true);
+      }
+    }
+
+    function copySnippet() {
+      const el = document.getElementById("snippetText");
+      el.select();
+      navigator.clipboard && navigator.clipboard.writeText(el.value);
+    }
+
+    async function revokeVersion(tokenEncoded) {
+      if (!confirm("이 배포본을 폐기 처리할까요? (기존 파일은 계속 신호를 보낼 수 있지만 목록에 폐기 표시됩니다)")) return;
+      await fetch(`/admin/api/versions/${tokenEncoded}/revoke`, { method: "POST", credentials: "same-origin" });
+      loadVersions();
+    }
+
     async function loadLogs(page) {
       cur = page < 1 ? 1 : page;
       const ip = document.getElementById("f-ip").value.trim();
@@ -523,12 +712,40 @@ DASHBOARD_TEMPLATE = """\
       const d = await api(url);
       if (!d) return;
       const tb = document.querySelector("#logs tbody");
-      tb.innerHTML = d.rows.length ? d.rows.map(r => `<tr>
-        <td>${r.id}</td><td>${escapeHtml(r.ip)}</td>
-        <td>${r.track_id ? `<span class="badge" title="${escapeHtml(r.track_id)}">${escapeHtml(r.track_id.slice(0,8))}…</span>` : "-"}</td>
+      tb.innerHTML = d.rows.length ? d.rows.map(r => {
+        // 배포본 라벨 셀
+        let idCell;
+        if (r.verified && r.label) {
+          idCell = `<span class="badge">${escapeHtml(r.label)}</span>` +
+                   (r.revoked ? ' <span class="tag-revoked">폐기됨</span>' : '');
+        } else if (r.verified) {
+          idCell = `<span class="badge" title="${escapeHtml(r.token || '')}">미등록 토큰</span>`;
+        } else if (r.track_id) {
+          idCell = `<span class="tag-warn" title="${escapeHtml(r.track_id)}">위조 의심</span>`;
+        } else {
+          idCell = "-";
+        }
+
+        // 클라이언트 IP 셀: 서버 IP와 다르면 VPN/프록시 의심 표시
+        let clientIpCell;
+        if (!r.client_ip) {
+          clientIpCell = '<span style="color:#94a3b8">-</span>';
+        } else if (r.ip_mismatch) {
+          clientIpCell = `<span class="tag-warn" title="서버 확인 IP(${escapeHtml(r.ip)})와 다름 — VPN/프록시 의심">`
+                       + `${escapeHtml(r.client_ip)} ⚠</span>`;
+        } else {
+          clientIpCell = `<span style="color:#64748b">${escapeHtml(r.client_ip)}</span>`;
+        }
+
+        return `<tr>
+        <td>${r.id}</td>
+        <td>${escapeHtml(r.ip)}</td>
+        <td>${clientIpCell}</td>
+        <td>${idCell}</td>
         <td title="${escapeHtml(r.user_agent || '')}">${escapeHtml((r.user_agent || "").slice(0,40))}</td>
         <td>${fmt(r.created_at)}</td>
-      </tr>`).join("") : `<tr><td colspan="5" class="empty">로그가 없습니다</td></tr>`;
+      </tr>`;
+      }).join("") : `<tr><td colspan="6" class="empty">로그가 없습니다</td></tr>`;
       document.getElementById("page-info").textContent = `페이지 ${d.page}/${d.pages} (총 ${d.total}건)`;
       document.getElementById("prev").disabled = d.page <= 1;
       document.getElementById("next").disabled = d.page >= d.pages;
@@ -539,7 +756,7 @@ DASHBOARD_TEMPLATE = """\
     async function refreshAll() {
       try {
         showError(false);
-        await Promise.all([loadStats(), loadLogs(cur)]);
+        await Promise.all([loadStats(), loadLogs(cur), loadVersions()]);
         document.getElementById("refreshed").textContent =
           "마지막 갱신: " + new Date().toLocaleTimeString("ko-KR");
       } catch (e) {
@@ -640,7 +857,10 @@ def api_stats():
     total = db.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
     u_ip = db.execute("SELECT COUNT(DISTINCT ip) FROM access_log").fetchone()[0]
     u_id = db.execute(
-        "SELECT COUNT(DISTINCT track_id) FROM access_log WHERE track_id IS NOT NULL AND track_id != ''"
+        "SELECT COUNT(DISTINCT token) FROM access_log WHERE verified = 1"
+    ).fetchone()[0]
+    tamper = db.execute(
+        "SELECT COUNT(*) FROM access_log WHERE verified = 0 AND track_id IS NOT NULL AND track_id != ''"
     ).fetchone()[0]
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     today = db.execute(
@@ -661,7 +881,7 @@ def api_stats():
         day = (datetime.now(timezone.utc) - timedelta(days=i)).strftime("%Y-%m-%d")
         trend.append([day, trend_rows.get(day, 0)])
 
-    payload = dict(total=total, unique_ips=u_ip, unique_ids=u_id,
+    payload = dict(total=total, unique_ips=u_ip, unique_ids=u_id, tamper_count=tamper,
                    today=today, top_ips=top, trend=trend)
     with _stats_lock:
         _stats_cache["data"] = payload
@@ -684,15 +904,21 @@ def api_logs():
     pages = max(1, (total + size - 1) // size)
     page = min(page, pages)
     rows = db.execute(
-        f"SELECT id, ip, track_id, user_agent, created_at FROM access_log {where_sql} "
-        f"ORDER BY id DESC LIMIT ? OFFSET ?",
+        f"SELECT a.id, a.ip, a.client_ip, a.ip_mismatch, a.track_id, a.token, "
+        f"a.verified, a.user_agent, a.created_at, v.label, v.revoked "
+        f"FROM access_log a LEFT JOIN track_versions v ON v.token = a.token "
+        f"{where_sql} "
+        f"ORDER BY a.id DESC LIMIT ? OFFSET ?",
         params + [size, (page - 1) * size],
     ).fetchall()
 
     return jsonify(
         page=page, pages=pages, total=total,
         rows=[
-            {"id": r[0], "ip": r[1], "track_id": r[2], "user_agent": r[3], "created_at": r[4]}
+            {"id": r[0], "ip": r[1], "client_ip": r[2], "ip_mismatch": bool(r[3]),
+             "track_id": r[4], "token": r[5], "verified": bool(r[6]),
+             "user_agent": r[7], "created_at": r[8],
+             "label": r[9], "revoked": bool(r[10]) if r[10] is not None else False}
             for r in rows
         ],
     )
@@ -707,14 +933,18 @@ def api_export():
     where_sql, params = _log_filter_clause()
     db = get_db()
     rows = db.execute(
-        f"SELECT id, ip, track_id, user_agent, created_at FROM access_log {where_sql} "
-        f"ORDER BY id DESC LIMIT 10000",
+        f"SELECT a.id, a.ip, a.client_ip, a.ip_mismatch, a.track_id, a.token, "
+        f"a.verified, v.label, a.user_agent, a.created_at "
+        f"FROM access_log a LEFT JOIN track_versions v ON v.token = a.token "
+        f"{where_sql} "
+        f"ORDER BY a.id DESC LIMIT 10000",
         params,
     ).fetchall()
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["id", "ip", "track_id", "user_agent", "created_at"])
+    writer.writerow(["id", "ip", "client_ip", "ip_mismatch", "raw_track_id",
+                     "token", "verified", "label", "user_agent", "created_at"])
     writer.writerows(rows)
 
     return Response(
@@ -722,6 +952,134 @@ def api_export():
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=access_log_export.csv"},
     )
+
+
+# ── 배포본(버전) 관리 API ────────────────────────────────────────
+# "여러 버전으로 배포하고 각 배포본을 추적"하는 용도: 라벨(예: "고객사A",
+# "2024-06 인쇄본")별로 서명된 고정 track_id를 발급하고, 그 ID가 박힌
+# tracking snippet을 받아서 실제 파일에 심는다. 이후 /track으로 들어오는
+# 서명이 유효한 요청은 이 라벨과 자동으로 매칭되어 대시보드에 표시된다.
+
+def _render_snippet(signed_id: str) -> str:
+    base = request.url_root.rstrip("/")
+    track_url = f"{base}/track"
+    ip_url    = f"{base}/ip"
+    return (
+        '<script>\n'
+        '(function(){\n'
+        f'  var TRACK_ID="{signed_id}";\n'
+        f'  var TRACK_URL="{track_url}";\n'
+        f'  var IP_URL="{ip_url}";\n'
+        '  var ipCache=null;\n'
+        '\n'
+        '  // fetchIp: URL에서 IP 문자열을 꺼낸다.\n'
+        '  //   plain=false(기본) → JSON 응답에서 .ip 필드 추출  (ipify, /track, /ip 형식)\n'
+        '  //   plain=true        → 응답 텍스트 전체를 IP로 취급 (icanhazip, ipapi.co 형식)\n'
+        '  function fetchIp(url,plain){\n'
+        '    return fetch(url,{mode:"cors",credentials:"omit"})\n'
+        '      .then(function(r){if(!r.ok)throw new Error(r.status);return plain?r.text():r.json();})\n'
+        '      .then(function(d){var ip=(plain?d:d.ip||"").trim();if(!ip)throw new Error("no ip");return ip;});\n'
+        '  }\n'
+        '\n'
+        '  // getIp: 외부 서비스→자체 서버 순서로 IP 획득을 시도.\n'
+        '  // 자체 /track이 마지막 폴백이 되어 외부 서비스가 전부 막혀도 동작한다.\n'
+        '  function getIp(){\n'
+        '    if(ipCache)return Promise.resolve(ipCache);\n'
+        '    return fetchIp("https://api4.ipify.org?format=json")\n'
+        '      .catch(function(){return fetchIp("https://ipv4.icanhazip.com",true);})\n'
+        '      .catch(function(){return fetchIp("https://ipapi.co/ip/",true);})\n'
+        '      .catch(function(){return fetchIp(IP_URL);})\n'  # 자체 서버 최종 폴백
+        '      .then(function(ip){ipCache=ip;return ip;});\n'
+        '  }\n'
+        '\n'
+        '  // report: track_id와 IP를 함께 기록. /track은 서버가 확인한 IP를 반환하므로\n'
+        '  // 클라이언트 측 getIp()와 교차 확인이 가능하다.\n'
+        '  function report(){\n'
+        '    getIp().catch(function(){return null;}).then(function(clientIp){\n'
+        '      var payload=JSON.stringify({id:TRACK_ID,client_ip:clientIp});\n'
+        '      if(navigator.sendBeacon){\n'
+        '        navigator.sendBeacon(TRACK_URL,new Blob([payload],{type:"text/plain"}));\n'
+        '      } else {\n'
+        '        fetch(TRACK_URL,{method:"POST",headers:{"Content-Type":"text/plain"},\n'
+        '          body:payload,keepalive:true,mode:"cors"}).catch(function(){});\n'
+        '      }\n'
+        '    });\n'
+        '  }\n'
+        '\n'
+        '  report();\n'
+        '})();\n'
+        '</script>'
+    )
+
+
+@app.route("/admin/api/versions", methods=["GET"])
+def api_versions_list():
+    err = _require_admin()
+    if err:
+        return err
+
+    db = get_db()
+    rows = db.execute("""
+        SELECT v.token, v.label, v.revoked, v.created_at,
+               (SELECT COUNT(*) FROM access_log a WHERE a.token = v.token AND a.verified = 1) AS hits,
+               (SELECT MAX(a.created_at) FROM access_log a WHERE a.token = v.token AND a.verified = 1) AS last_seen
+        FROM track_versions v
+        ORDER BY v.created_at DESC
+    """).fetchall()
+
+    tamper_count = db.execute(
+        "SELECT COUNT(*) FROM access_log WHERE verified = 0 AND track_id IS NOT NULL AND track_id != ''"
+    ).fetchone()[0]
+
+    return jsonify(
+        versions=[
+            {"token": r[0], "label": r[1], "revoked": bool(r[2]), "created_at": r[3],
+             "hits": r[4], "last_seen": r[5]}
+            for r in rows
+        ],
+        tamper_count=tamper_count,
+    )
+
+
+@app.route("/admin/api/versions", methods=["POST"])
+def api_versions_create():
+    err = _require_admin()
+    if err:
+        return err
+
+    body = request.get_json(silent=True, force=True) or {}
+    label = str(body.get("label", "")).strip()[:100]
+    if not label:
+        return jsonify(error="label_required"), 400
+
+    # 기존에 발급했던 토큰을 그대로 다시 등록(복구)하고 싶을 때 사용.
+    # (예: 파일시스템 초기화로 track_versions 레지스트리를 잃어버렸지만
+    #  어딘가 따로 적어둔 토큰 값이 있는 경우 라벨을 다시 붙여 복구한다.
+    #  서명 자체는 TRACK_SIGNING_KEY만 그대로면 여전히 유효하다.)
+    existing_token = str(body.get("existing_token", "")).strip()[:64]
+    token = existing_token or _new_version_token()
+    signed_id = _sign_token(token)
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO track_versions (token, label, revoked, created_at) VALUES (?, ?, 0, ?) "
+        "ON CONFLICT(token) DO UPDATE SET label = excluded.label, revoked = 0",
+        (token, label, datetime.now(timezone.utc).isoformat()),
+    )
+    db.commit()
+
+    return jsonify(token=token, signed_id=signed_id, label=label, snippet=_render_snippet(signed_id))
+
+
+@app.route("/admin/api/versions/<token>/revoke", methods=["POST"])
+def api_versions_revoke(token):
+    err = _require_admin()
+    if err:
+        return err
+    db = get_db()
+    db.execute("UPDATE track_versions SET revoked = 1 WHERE token = ?", (token,))
+    db.commit()
+    return jsonify(ok=True)
 
 
 # ─── Entry point ───────────────────────────────────────────
