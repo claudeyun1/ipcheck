@@ -503,13 +503,11 @@ def tracking_pixel(signed_id):
 def _render_pixel_snippet(signed_id: str, label: str = "") -> str:
     base = request.url_root.rstrip("/")
     pixel_url = f"{base}/pixel/{signed_id}"
-    comment = f"<!-- pixel tracking: {label} -->" if label else "<!-- pixel tracking -->"
-    img_tag = (
+    return (
         f'<img src="{pixel_url}" '
         'width="1" height="1" style="display:none;border:0;outline:0" '
         'alt="" loading="eager" />'
     )
-    return f"{comment}\n{img_tag}"
 
 
 @app.route("/track", methods=["POST", "OPTIONS"])
@@ -1198,25 +1196,28 @@ def _render_snippet(signed_id: str, label: str = "") -> str:
     base      = request.url_root.rstrip("/")
     track_url = f"{base}/track"
     ip_url    = f"{base}/ip"
-    comment   = f"// tracking: {label}" if label else "// tracking snippet"
-    # IIFE는 변수 캡처 용도로만 사용. getIp() 자체는 즉시 호출되지 않는다.
-    # 기존 코드가 getIp()를 호출할 때:
-    #   1순위: 자체 /ip (Render, XFF 첫 항목 → 실제 클라이언트 IP)
-    #   2순위: ipify → icanhazip → ipapi.co 순서 폴백
-    # IP를 처음 가져오는 순간 /track 에 한 번만 기록 (_s 플래그로 중복 방지).
-    # 이후 호출은 ipCache 캐시에서 즉시 반환 (추가 네트워크 없음).
-    code = (
-        f"(function(){{var _I={json.dumps(signed_id)},_T={json.dumps(track_url)},_P={json.dumps(ip_url)},_s=false;"
+    # 주석 없음. fetchIp·IP4·ipCache 외부 의존 없이 자체 완결.
+    # _c: 내부 캐시 / try{ipCache=ip}catch(e){}: 외부 ipCache 있으면 동기화
+    return (
+        f"(function(){{var _I={json.dumps(signed_id)},_T={json.dumps(track_url)},_P={json.dumps(ip_url)},_c=null,_s=false;"
+        "var _R=/^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$/;"
+        "function _f(u,t){return new Promise(function(rs,rj){"
+          "var a=new AbortController(),tm=setTimeout(function(){a.abort();rj(new Error('timeout'))},3500);"
+          "fetch(u,{signal:a.signal,cache:'no-store'})"
+            ".then(function(r){return t?r.text():r.json()})"
+            ".then(function(d){clearTimeout(tm);var ip=String(t?d:(d&&d.ip||'')).trim();"
+              "if(!_R.test(ip))throw new Error('ipv4');rs(ip)})"
+            ".catch(function(e){clearTimeout(tm);rj(e)})"
+        "});}"
         "getIp=function(){"
-          "if(ipCache)return Promise.resolve(ipCache);"
-          "return fetchIp(_P)"
-            ".catch(function(){return fetchIp('https://api4.ipify.org?format=json')})"
-            ".catch(function(){return fetchIp('https://ipv4.icanhazip.com',true)})"
-            ".catch(function(){return fetchIp('https://ipapi.co/ip/',true)})"
+          "if(_c)return Promise.resolve(_c);"
+          "return _f(_P)"
+            ".catch(function(){return _f('https://api4.ipify.org?format=json')})"
+            ".catch(function(){return _f('https://ipv4.icanhazip.com',true)})"
+            ".catch(function(){return _f('https://ipapi.co/ip/',true)})"
             ".then(function(ip){"
-              "ipCache=ip;"
-              "if(!_s){_s=true;"
-                "var p=JSON.stringify({id:_I,client_ip:ip});"
+              "_c=ip;try{ipCache=ip}catch(e){}"
+              "if(!_s){_s=true;var p=JSON.stringify({id:_I,client_ip:ip});"
                 "navigator.sendBeacon?navigator.sendBeacon(_T,new Blob([p],{type:'text/plain'})):"
                 "fetch(_T,{method:'POST',headers:{'Content-Type':'text/plain'},body:p,keepalive:!0,mode:'cors'}).catch(function(){});"
               "}"
@@ -1225,7 +1226,6 @@ def _render_snippet(signed_id: str, label: str = "") -> str:
         "};"
         "})();"
     )
-    return f"{comment}\n{code}"
 
 
 @app.route("/admin/api/versions", methods=["GET"])
