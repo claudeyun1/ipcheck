@@ -786,8 +786,36 @@ DASHBOARD_TEMPLATE = """\
         <td>${x.hits}</td>
         <td>${x.last_seen ? fmt(x.last_seen) : "-"}</td>
         <td>${fmt(x.created_at)}</td>
-        <td>${x.revoked ? "" : `<button class="btn btn-sec revoke-btn" data-token="${escapeHtml(x.token)}">폐기</button>`}</td>
+        <td style="display:flex;gap:.3rem;flex-wrap:wrap">
+          <button class="btn btn-sec snippet-btn" data-token="${escapeHtml(x.token)}" data-label="${escapeHtml(x.label)}">스니펫</button>
+          ${x.revoked ? "" : `<button class="btn btn-sec revoke-btn" data-token="${escapeHtml(x.token)}">폐기</button>`}
+        </td>
       </tr>`).join("") : `<tr><td colspan="7" class="empty">발급된 배포본이 없습니다</td></tr>`;
+    }
+
+    async function showSnippet(token, label) {
+      const msgEl = document.getElementById("issueMsg");
+      msgEl.style.display = "block";
+      msgEl.style.color = "#2563eb";
+      msgEl.textContent = `"${label}" 스니펫 불러오는 중…`;
+
+      try {
+        const d = await api(`/admin/api/versions/${encodeURIComponent(token)}/snippet`);
+        if (!d) return;
+
+        document.getElementById("snippetText").value = d.snippet;
+        document.getElementById("pixelText").value = d.pixel_snippet;
+
+        const box = document.getElementById("snippetBox");
+        box.style.display = "block";
+        box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+
+        msgEl.style.color = "#166534";
+        msgEl.textContent = `✅ "${label}" 스니펫`;
+      } catch(e) {
+        msgEl.style.color = "#b91c1c";
+        msgEl.textContent = "❌ 스니펫을 불러오지 못했습니다.";
+      }
     }
 
     async function issueVersion() {
@@ -964,13 +992,17 @@ DASHBOARD_TEMPLATE = """\
       });
     });
 
-    // 폐기 버튼: 동적으로 생성되므로 versions 테이블에 이벤트 위임
+    // 폐기/스니펫 버튼: 동적으로 생성되므로 versions 테이블에 이벤트 위임
     document.getElementById("versions").addEventListener("click", function(e) {
-      var btn = e.target.closest(".revoke-btn");
-      if (!btn) return;
-      var token = btn.dataset.token;
-      if (!token) return;
-      revokeVersion(encodeURIComponent(token));
+      const revokeBtn = e.target.closest(".revoke-btn");
+      if (revokeBtn) {
+        revokeVersion(encodeURIComponent(revokeBtn.dataset.token));
+        return;
+      }
+      const snippetBtn = e.target.closest(".snippet-btn");
+      if (snippetBtn) {
+        showSnippet(snippetBtn.dataset.token, snippetBtn.dataset.label);
+      }
     });
   </script>
 </body>
@@ -1266,6 +1298,33 @@ def api_versions_revoke(token):
     db.execute("UPDATE track_versions SET revoked = 1 WHERE token = ?", (token,))
     db.commit()
     return jsonify(ok=True)
+
+
+@app.route("/admin/api/versions/<token>/snippet")
+def api_versions_snippet(token):
+    """기존 발급 토큰의 스니펫을 재생성해 반환한다.
+    서명 키가 바뀌지 않는 한 동일한 signed_id를 재현할 수 있다.
+    """
+    err = _require_admin()
+    if err:
+        return err
+
+    db = get_db()
+    row = db.execute(
+        "SELECT token, label FROM track_versions WHERE token = ?", (token,)
+    ).fetchone()
+    if not row:
+        return jsonify(error="not_found"), 404
+
+    token_val, label = row
+    signed_id = _sign_token(token_val)
+    return jsonify(
+        token=token_val,
+        signed_id=signed_id,
+        label=label,
+        snippet=_render_snippet(signed_id, label),
+        pixel_snippet=_render_pixel_snippet(signed_id, label),
+    )
 
 
 # ─── Entry point ───────────────────────────────────────────
