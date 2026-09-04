@@ -97,7 +97,13 @@ if not _admin_pass_hash:
         print("⚠  ADMIN_PASS가 기본값(admin123)입니다. 운영 환경에서는 반드시 변경하세요.")
     _admin_pass_hash = generate_password_hash(_plain_pw)
 
-TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "0"))
+TRUSTED_PROXY_HOPS = int(os.environ.get(
+    "TRUSTED_PROXY_HOPS",
+    # Render는 모든 요청을 자체 로드밸런서 1홉을 거쳐 전달하므로,
+    # RENDER 환경변수(Render가 자동 주입)가 있으면 기본값을 1로 설정한다.
+    # 그렇지 않으면(로컬 등) 0으로 두어 XFF 스푸핑을 방지한다.
+    "1" if os.environ.get("RENDER") else "0"
+))
 HTTPS_ONLY = os.environ.get("HTTPS_ONLY", "0") == "1"
 SESSION_MINUTES = int(os.environ.get("SESSION_MINUTES", "30"))
 
