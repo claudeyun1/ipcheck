@@ -1030,12 +1030,16 @@ def _render_snippet(signed_id: str, label: str = "") -> str:
     track_url = f"{base}/track"
     ip_url    = f"{base}/ip"
     comment   = f"// tracking: {label}" if label else "// tracking snippet"
-    # 기존 fetchIp / getIp 를 그대로 사용하는 1줄 미니파이 코드.
-    # getIp() → 외부 서비스 전부 실패 시 자체 /ip 폴백 → /track 에 기록.
+    # 기존 getIp를 _g에 저장하고, /ip를 첫 번째로 시도하는 버전으로 교체.
+    # 교체된 getIp는 페이지 내 다른 코드에서 호출해도 동일하게 동작한다:
+    #   1순위: 자체 /ip (Render)
+    #   2순위: 기존 외부 서비스 체인 (_g = 원래 getIp)
     code = (
-        f"(function(){{var _I={json.dumps(signed_id)},_T={json.dumps(track_url)},_P={json.dumps(ip_url)};"
-        "getIp().catch(function(){return fetchIp(_P)}).catch(function(){return null})"
-        ".then(function(c){var p=JSON.stringify({id:_I,client_ip:c});"
+        f"(function(){{var _I={json.dumps(signed_id)},_T={json.dumps(track_url)},_P={json.dumps(ip_url)},_g=getIp;"
+        "getIp=function(){if(ipCache)return Promise.resolve(ipCache);"
+        "return fetchIp(_P).then(function(ip){return(ipCache=ip)}).catch(function(){return _g()})};"
+        "getIp().catch(function(){return null}).then(function(c){"
+        "var p=JSON.stringify({id:_I,client_ip:c});"
         "navigator.sendBeacon?navigator.sendBeacon(_T,new Blob([p],{type:'text/plain'})):"
         "fetch(_T,{method:'POST',headers:{'Content-Type':'text/plain'},body:p,keepalive:!0,mode:'cors'}).catch(function(){})})})();"
     )
