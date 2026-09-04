@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: ip-logger
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn -w 1 --threads 4 -b 0.0.0.0:$PORT ip_logger:app"
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true          # Render가 랜덤 고정값을 생성해 저장해줌
+      - key: ADMIN_USER
+        value: admin
+      - key: ADMIN_PASS_HASH
+        sync: false                  # 대시보드에서 직접 입력 (평문 ADMIN_PASS 대신 해시 권장)
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"
+      - key: HTTPS_ONLY
+        value: "1"
+      - key: SESSION_MINUTES
+        value: "30"
