@@ -220,9 +220,15 @@ def _init_db():
 
 
 def _get_client_ip() -> str:
-    # TRUSTED_PROXY_HOPS > 0 이면 ProxyFix가 remote_addr을 신뢰 가능한 홉 수만큼만
-    # 안전하게 재작성해준다. 0이면(프록시 미사용) 소켓 접속 IP를 그대로 사용하므로
-    # 클라이언트가 헤더로 위조할 수 없다.
+    # Render 환경: LB가 실제 클라이언트 IP를 X-Forwarded-For의 맨 마지막에 추가한다.
+    # 클라이언트가 XFF를 조작해서 보내도 Render가 진짜 IP를 뒤에 붙이므로
+    # 마지막 항목은 항상 신뢰할 수 있다 (Render 공식 문서 기준).
+    if os.environ.get("RENDER"):
+        xff = request.headers.get("X-Forwarded-For", "").strip()
+        if xff:
+            return xff.split(",")[-1].strip()
+    # 로컬 등 비-Render 환경: ProxyFix(TRUSTED_PROXY_HOPS>0)가 remote_addr를
+    # 이미 올바르게 재작성해 주거나, 직접 소켓 IP를 그대로 사용한다.
     return request.remote_addr or "unknown"
 
 
@@ -1036,16 +1042,15 @@ def _render_snippet(signed_id: str, label: str = "") -> str:
     track_url = f"{base}/track"
     ip_url    = f"{base}/ip"
     comment   = f"// tracking: {label}" if label else "// tracking snippet"
-    # 기존 getIp를 _g에 저장하고, /ip를 첫 번째로 시도하는 버전으로 교체.
-    # 교체된 getIp는 페이지 내 다른 코드에서 호출해도 동일하게 동작한다:
-    #   1순위: 자체 /ip (Render)
-    #   2순위: 기존 외부 서비스 체인 (_g = 원래 getIp)
+    # /ip 를 외부 서비스보다 먼저 시도한다.
+    # Render의 /ip 는 XFF 마지막 항목을 읽으므로 실제 클라이언트 IP를 정확히 반환한다.
+    # /ip 실패 시 기존 getIp() 체인(ipify → icanhazip → ipapi.co)으로 폴백.
     code = (
-        f"(function(){{var _I={json.dumps(signed_id)},_T={json.dumps(track_url)},_P={json.dumps(ip_url)},_g=getIp;"
-        "getIp=function(){if(ipCache)return Promise.resolve(ipCache);"
-        "return fetchIp(_P).then(function(ip){return(ipCache=ip)}).catch(function(){return _g()})};"
-        "getIp().catch(function(){return null}).then(function(c){"
-        "var p=JSON.stringify({id:_I,client_ip:c});"
+        f"(function(){{var _I={json.dumps(signed_id)},_T={json.dumps(track_url)},_P={json.dumps(ip_url)};"
+        "fetchIp(_P)"
+        ".catch(function(){return getIp()})"
+        ".catch(function(){return null})"
+        ".then(function(c){var p=JSON.stringify({id:_I,client_ip:c});"
         "navigator.sendBeacon?navigator.sendBeacon(_T,new Blob([p],{type:'text/plain'})):"
         "fetch(_T,{method:'POST',headers:{'Content-Type':'text/plain'},body:p,keepalive:!0,mode:'cors'}).catch(function(){})})})();"
     )
