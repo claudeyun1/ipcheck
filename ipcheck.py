@@ -220,15 +220,19 @@ def _init_db():
 
 
 def _get_client_ip() -> str:
-    # Render 환경: LB가 실제 클라이언트 IP를 X-Forwarded-For의 맨 마지막에 추가한다.
-    # 클라이언트가 XFF를 조작해서 보내도 Render가 진짜 IP를 뒤에 붙이므로
-    # 마지막 항목은 항상 신뢰할 수 있다 (Render 공식 문서 기준).
+    # 표준 프록시 체인 동작:
+    #   브라우저(1.2.3.4) → Render Edge → Render LB → Flask
+    #   각 프록시는 자신이 받은 소스 IP를 XFF 맨 뒤에 추가한다.
+    #   결과: X-Forwarded-For: 1.2.3.4, render-edge-ip
+    #   → 첫 번째(좌측) = 실제 브라우저 IP
+    #   → 마지막(우측) = Render 내부 프록시 IP (우리가 원하지 않는 값)
+    #
+    # 주의: 클라이언트가 XFF를 조작해 보내면(fake, 1.2.3.4, ...) 첫 번째가 틀릴 수 있으나,
+    #        라이선스 추적 용도에서 일반 사용자가 XFF를 조작할 가능성은 낮다.
     if os.environ.get("RENDER"):
         xff = request.headers.get("X-Forwarded-For", "").strip()
         if xff:
-            return xff.split(",")[-1].strip()
-    # 로컬 등 비-Render 환경: ProxyFix(TRUSTED_PROXY_HOPS>0)가 remote_addr를
-    # 이미 올바르게 재작성해 주거나, 직접 소켓 IP를 그대로 사용한다.
+            return xff.split(",")[0].strip()   # 첫 번째 = 원본 클라이언트 IP
     return request.remote_addr or "unknown"
 
 
@@ -415,12 +419,33 @@ def serve_page():
 
 @app.route("/ip", methods=["GET", "OPTIONS"])
 def ip_lookup():
-    """로깅 없이 클라이언트 IP만 반환. getIp() 폴백 체인의 끝단으로 사용.
-    응답 형식: {"ip": "x.x.x.x"}  ← ipify(api4.ipify.org) 와 동일한 포맷.
-    """
+    """로깅 없이 클라이언트 IP만 반환. getIp() 폴백 체인의 끝단으로 사용."""
     if request.method == "OPTIONS":
         return "", 204
     return jsonify(ip=_get_client_ip())
+
+
+@app.route("/admin/api/debug-headers")
+def api_debug_headers():
+    """XFF 구조 진단용 (관리자 전용).
+    /ip 가 잘못된 IP를 반환할 때 실제로 어떤 헤더가 오는지 확인한다.
+    예: https://서비스.onrender.com/admin/api/debug-headers (로그인 후)
+    """
+    err = _require_admin()
+    if err:
+        return err
+    xff = request.headers.get("X-Forwarded-For", "")
+    entries = [x.strip() for x in xff.split(",")] if xff else []
+    return jsonify(
+        detected_ip     = _get_client_ip(),
+        remote_addr     = request.remote_addr,
+        x_forwarded_for = xff,
+        xff_entries     = entries,
+        xff_first       = entries[0]  if entries else None,
+        xff_last        = entries[-1] if entries else None,
+        render_env      = bool(os.environ.get("RENDER")),
+        trusted_hops    = TRUSTED_PROXY_HOPS,
+    )
 
 
 @app.route("/track", methods=["POST", "OPTIONS"])
