@@ -57,6 +57,7 @@ import csv
 import hashlib
 import hmac
 import io
+import json
 import os
 import secrets
 import sqlite3
@@ -1024,56 +1025,21 @@ def api_export():
 # tracking snippet을 받아서 실제 파일에 심는다. 이후 /track으로 들어오는
 # 서명이 유효한 요청은 이 라벨과 자동으로 매칭되어 대시보드에 표시된다.
 
-def _render_snippet(signed_id: str) -> str:
-    base = request.url_root.rstrip("/")
+def _render_snippet(signed_id: str, label: str = "") -> str:
+    base      = request.url_root.rstrip("/")
     track_url = f"{base}/track"
     ip_url    = f"{base}/ip"
-    return (
-        '<script>\n'
-        '(function(){\n'
-        f'  var TRACK_ID="{signed_id}";\n'
-        f'  var TRACK_URL="{track_url}";\n'
-        f'  var IP_URL="{ip_url}";\n'
-        '  var ipCache=null;\n'
-        '\n'
-        '  // fetchIp: URL에서 IP 문자열을 꺼낸다.\n'
-        '  //   plain=false(기본) → JSON 응답에서 .ip 필드 추출  (ipify, /track, /ip 형식)\n'
-        '  //   plain=true        → 응답 텍스트 전체를 IP로 취급 (icanhazip, ipapi.co 형식)\n'
-        '  function fetchIp(url,plain){\n'
-        '    return fetch(url,{mode:"cors",credentials:"omit"})\n'
-        '      .then(function(r){if(!r.ok)throw new Error(r.status);return plain?r.text():r.json();})\n'
-        '      .then(function(d){var ip=(plain?d:d.ip||"").trim();if(!ip)throw new Error("no ip");return ip;});\n'
-        '  }\n'
-        '\n'
-        '  // getIp: 외부 서비스→자체 서버 순서로 IP 획득을 시도.\n'
-        '  // 자체 /track이 마지막 폴백이 되어 외부 서비스가 전부 막혀도 동작한다.\n'
-        '  function getIp(){\n'
-        '    if(ipCache)return Promise.resolve(ipCache);\n'
-        '    return fetchIp("https://api4.ipify.org?format=json")\n'
-        '      .catch(function(){return fetchIp("https://ipv4.icanhazip.com",true);})\n'
-        '      .catch(function(){return fetchIp("https://ipapi.co/ip/",true);})\n'
-        '      .catch(function(){return fetchIp(IP_URL);})\n'  # 자체 서버 최종 폴백
-        '      .then(function(ip){ipCache=ip;return ip;});\n'
-        '  }\n'
-        '\n'
-        '  // report: track_id와 IP를 함께 기록. /track은 서버가 확인한 IP를 반환하므로\n'
-        '  // 클라이언트 측 getIp()와 교차 확인이 가능하다.\n'
-        '  function report(){\n'
-        '    getIp().catch(function(){return null;}).then(function(clientIp){\n'
-        '      var payload=JSON.stringify({id:TRACK_ID,client_ip:clientIp});\n'
-        '      if(navigator.sendBeacon){\n'
-        '        navigator.sendBeacon(TRACK_URL,new Blob([payload],{type:"text/plain"}));\n'
-        '      } else {\n'
-        '        fetch(TRACK_URL,{method:"POST",headers:{"Content-Type":"text/plain"},\n'
-        '          body:payload,keepalive:true,mode:"cors"}).catch(function(){});\n'
-        '      }\n'
-        '    });\n'
-        '  }\n'
-        '\n'
-        '  report();\n'
-        '})();\n'
-        '</script>'
+    comment   = f"// tracking: {label}" if label else "// tracking snippet"
+    # 기존 fetchIp / getIp 를 그대로 사용하는 1줄 미니파이 코드.
+    # getIp() → 외부 서비스 전부 실패 시 자체 /ip 폴백 → /track 에 기록.
+    code = (
+        f"(function(){{var _I={json.dumps(signed_id)},_T={json.dumps(track_url)},_P={json.dumps(ip_url)};"
+        "getIp().catch(function(){return fetchIp(_P)}).catch(function(){return null})"
+        ".then(function(c){var p=JSON.stringify({id:_I,client_ip:c});"
+        "navigator.sendBeacon?navigator.sendBeacon(_T,new Blob([p],{type:'text/plain'})):"
+        "fetch(_T,{method:'POST',headers:{'Content-Type':'text/plain'},body:p,keepalive:!0,mode:'cors'}).catch(function(){})})})();"
     )
+    return f"{comment}\n{code}"
 
 
 @app.route("/admin/api/versions", methods=["GET"])
@@ -1132,7 +1098,7 @@ def api_versions_create():
     )
     db.commit()
 
-    return jsonify(token=token, signed_id=signed_id, label=label, snippet=_render_snippet(signed_id))
+    return jsonify(token=token, signed_id=signed_id, label=label, snippet=_render_snippet(signed_id, label))
 
 
 @app.route("/admin/api/versions/<token>/revoke", methods=["POST"])
