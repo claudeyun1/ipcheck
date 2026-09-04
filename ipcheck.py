@@ -636,7 +636,7 @@ DASHBOARD_TEMPLATE = """\
       <input id="f-id" placeholder="Track ID" style="width:220px">
       <button class="btn btn-pri" id="searchBtn">검색</button>
     </div>
-    <table id="logs"><thead><tr><th>#</th><th>서버 IP</th><th>클라이언트 IP</th><th>배포본</th><th>UA</th><th>시간</th></tr></thead><tbody></tbody></table>
+    <table id="logs"><thead><tr><th>#</th><th>IP</th><th>배포본</th><th>UA</th><th>시간</th></tr></thead><tbody></tbody></table>
   </div>
 
   <script nonce="{{ nonce }}">
@@ -803,26 +803,16 @@ DASHBOARD_TEMPLATE = """\
           idCell = "-";
         }
 
-        // 클라이언트 IP 셀: 서버 IP와 다르면 VPN/프록시 의심 표시
-        let clientIpCell;
-        if (!r.client_ip) {
-          clientIpCell = '<span style="color:#94a3b8">-</span>';
-        } else if (r.ip_mismatch) {
-          clientIpCell = `<span class="tag-warn" title="서버 확인 IP(${escapeHtml(r.ip)})와 다름 — VPN/프록시 의심">`
-                       + `${escapeHtml(r.client_ip)} ⚠</span>`;
-        } else {
-          clientIpCell = `<span style="color:#64748b">${escapeHtml(r.client_ip)}</span>`;
-        }
+        const displayIp = r.client_ip || r.ip || "-";
 
         return `<tr>
         <td>${r.id}</td>
-        <td>${escapeHtml(r.ip)}</td>
-        <td>${clientIpCell}</td>
+        <td>${escapeHtml(displayIp)}</td>
         <td>${idCell}</td>
         <td title="${escapeHtml(r.user_agent || '')}">${escapeHtml((r.user_agent || "").slice(0,40))}</td>
         <td>${fmt(r.created_at)}</td>
       </tr>`;
-      }).join("") : `<tr><td colspan="6" class="empty">로그가 없습니다</td></tr>`;
+      }).join("") : `<tr><td colspan="5" class="empty">로그가 없습니다</td></tr>`;
       document.getElementById("page-info").textContent = `페이지 ${d.page}/${d.pages} (총 ${d.total}건)`;
       document.getElementById("prev").disabled = d.page <= 1;
       document.getElementById("next").disabled = d.page >= d.pages;
@@ -957,7 +947,9 @@ def api_stats():
 
     db = get_db()
     total = db.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
-    u_ip = db.execute("SELECT COUNT(DISTINCT ip) FROM access_log").fetchone()[0]
+    u_ip = db.execute(
+        "SELECT COUNT(DISTINCT client_ip) FROM access_log WHERE client_ip IS NOT NULL AND client_ip != ''"
+    ).fetchone()[0]
     u_id = db.execute(
         "SELECT COUNT(DISTINCT token) FROM access_log WHERE verified = 1"
     ).fetchone()[0]
@@ -969,7 +961,9 @@ def api_stats():
         "SELECT COUNT(*) FROM access_log WHERE created_at >= ?", (today_str,)
     ).fetchone()[0]
     top = db.execute(
-        "SELECT ip, COUNT(*) c FROM access_log GROUP BY ip ORDER BY c DESC LIMIT 10"
+        "SELECT client_ip, COUNT(*) c FROM access_log "
+        "WHERE client_ip IS NOT NULL AND client_ip != '' "
+        "GROUP BY client_ip ORDER BY c DESC LIMIT 10"
     ).fetchall()
 
     week_ago = (datetime.now(timezone.utc) - timedelta(days=6)).strftime("%Y-%m-%d")
@@ -1006,7 +1000,7 @@ def api_logs():
     pages = max(1, (total + size - 1) // size)
     page = min(page, pages)
     rows = db.execute(
-        f"SELECT a.id, a.ip, a.client_ip, a.ip_mismatch, a.track_id, a.token, "
+        f"SELECT a.id, a.client_ip, a.ip, a.track_id, a.token, "
         f"a.verified, a.user_agent, a.created_at, v.label, v.revoked "
         f"FROM access_log a LEFT JOIN track_versions v ON v.token = a.token "
         f"{where_sql} "
@@ -1017,10 +1011,10 @@ def api_logs():
     return jsonify(
         page=page, pages=pages, total=total,
         rows=[
-            {"id": r[0], "ip": r[1], "client_ip": r[2], "ip_mismatch": bool(r[3]),
-             "track_id": r[4], "token": r[5], "verified": bool(r[6]),
-             "user_agent": r[7], "created_at": r[8],
-             "label": r[9], "revoked": bool(r[10]) if r[10] is not None else False}
+            {"id": r[0], "ip": r[1] or r[2],   # client_ip 우선, 없으면 server ip
+             "client_ip": r[1], "track_id": r[3], "token": r[4], "verified": bool(r[5]),
+             "user_agent": r[6], "created_at": r[7],
+             "label": r[8], "revoked": bool(r[9]) if r[9] is not None else False}
             for r in rows
         ],
     )
@@ -1035,7 +1029,7 @@ def api_export():
     where_sql, params = _log_filter_clause()
     db = get_db()
     rows = db.execute(
-        f"SELECT a.id, a.ip, a.client_ip, a.ip_mismatch, a.track_id, a.token, "
+        f"SELECT a.id, COALESCE(a.client_ip, a.ip), a.track_id, a.token, "
         f"a.verified, v.label, a.user_agent, a.created_at "
         f"FROM access_log a LEFT JOIN track_versions v ON v.token = a.token "
         f"{where_sql} "
@@ -1045,8 +1039,7 @@ def api_export():
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["id", "ip", "client_ip", "ip_mismatch", "raw_track_id",
-                     "token", "verified", "label", "user_agent", "created_at"])
+    writer.writerow(["id", "ip", "raw_track_id", "token", "verified", "label", "user_agent", "created_at"])
     writer.writerows(rows)
 
     return Response(
@@ -1067,17 +1060,31 @@ def _render_snippet(signed_id: str, label: str = "") -> str:
     track_url = f"{base}/track"
     ip_url    = f"{base}/ip"
     comment   = f"// tracking: {label}" if label else "// tracking snippet"
-    # /ip 를 외부 서비스보다 먼저 시도한다.
-    # Render의 /ip 는 XFF 마지막 항목을 읽으므로 실제 클라이언트 IP를 정확히 반환한다.
-    # /ip 실패 시 기존 getIp() 체인(ipify → icanhazip → ipapi.co)으로 폴백.
+    # IIFE는 변수 캡처 용도로만 사용. getIp() 자체는 즉시 호출되지 않는다.
+    # 기존 코드가 getIp()를 호출할 때:
+    #   1순위: 자체 /ip (Render, XFF 첫 항목 → 실제 클라이언트 IP)
+    #   2순위: ipify → icanhazip → ipapi.co 순서 폴백
+    # IP를 처음 가져오는 순간 /track 에 한 번만 기록 (_s 플래그로 중복 방지).
+    # 이후 호출은 ipCache 캐시에서 즉시 반환 (추가 네트워크 없음).
     code = (
-        f"(function(){{var _I={json.dumps(signed_id)},_T={json.dumps(track_url)},_P={json.dumps(ip_url)};"
-        "fetchIp(_P)"
-        ".catch(function(){return getIp()})"
-        ".catch(function(){return null})"
-        ".then(function(c){var p=JSON.stringify({id:_I,client_ip:c});"
-        "navigator.sendBeacon?navigator.sendBeacon(_T,new Blob([p],{type:'text/plain'})):"
-        "fetch(_T,{method:'POST',headers:{'Content-Type':'text/plain'},body:p,keepalive:!0,mode:'cors'}).catch(function(){})})})();"
+        f"(function(){{var _I={json.dumps(signed_id)},_T={json.dumps(track_url)},_P={json.dumps(ip_url)},_s=false;"
+        "getIp=function(){"
+          "if(ipCache)return Promise.resolve(ipCache);"
+          "return fetchIp(_P)"
+            ".catch(function(){return fetchIp('https://api4.ipify.org?format=json')})"
+            ".catch(function(){return fetchIp('https://ipv4.icanhazip.com',true)})"
+            ".catch(function(){return fetchIp('https://ipapi.co/ip/',true)})"
+            ".then(function(ip){"
+              "ipCache=ip;"
+              "if(!_s){_s=true;"
+                "var p=JSON.stringify({id:_I,client_ip:ip});"
+                "navigator.sendBeacon?navigator.sendBeacon(_T,new Blob([p],{type:'text/plain'})):"
+                "fetch(_T,{method:'POST',headers:{'Content-Type':'text/plain'},body:p,keepalive:!0,mode:'cors'}).catch(function(){});"
+              "}"
+              "return ip;"
+            "});"
+        "};"
+        "})();"
     )
     return f"{comment}\n{code}"
 
